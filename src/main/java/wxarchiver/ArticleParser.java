@@ -18,7 +18,12 @@ import java.util.regex.Pattern;
 /** 解析公众号文章页：元数据 + 正文 Markdown + 图片列表。 */
 final class ArticleParser {
 
-    enum Status { OK, BLOCKED, INVALID, GONE }
+    /**
+     * DELETED：页面明确说了已删除 / 违规，记入进度不再重试。
+     * UNKNOWN：没有正文、也认不出原因的页面，不记进度，下次运行重试。
+     * （旧版本把认不出的页面一律记成 GONE，图文消息因此被误判，GONE 记录在加载进度时会被忽略。）
+     */
+    enum Status { OK, BLOCKED, INVALID, DELETED, UNKNOWN }
 
     record Article(Status status, String biz, String mid, String idx, String sn, String title, String account,
                    String author, String date, String markdown, List<String> images) {
@@ -30,7 +35,9 @@ final class ArticleParser {
     private static final DateTimeFormatter DAY = DateTimeFormatter.ofPattern("yyyy-MM-dd")
             .withZone(ZoneId.of("Asia/Shanghai"));
     private static final Pattern IMG_MD = Pattern.compile("!\\[[^\\]]*]\\(([^)\\s]+)\\)");
-    private static final Pattern CONTENT_JS = Pattern.compile("content_noencode:\\s*'((?:[^'\\\\]|\\\\.)*)'");
+    // 展开写法 + 占有量词：(?:[^'\\]|\\.)* 这种「分支套循环」每个字符递归一层，长正文会 StackOverflowError
+    private static final Pattern CONTENT_JS =
+            Pattern.compile("content_noencode:\\s*'([^'\\\\]*+(?:\\\\.[^'\\\\]*+)*+)'");
     private static final Pattern HTML_TAG = Pattern.compile(
             "<\\s*(p|section|div|img|br|h[1-6]|ul|ol|li|span|strong)\\b", Pattern.CASE_INSENSITIVE);
 
@@ -38,17 +45,23 @@ final class ArticleParser {
     }
 
     static Article parse(String html) {
-        String biz = firstVar(html, "var biz = \"([^\"]+)\"");
-        String mid = firstVar(html, "var mid = \"(\\d+)\"");
-        String idx = firstVar(html, "var idx = \"(\\d+)\"");
-        String sn = firstVar(html, "var sn = \"([0-9a-f]+)\"");
+        return parse(html, "");
+    }
+
+    /** url 用来兜底 biz/mid/idx/sn：图文消息等页面不一定有 {@code var mid = "..."} 这种写法。 */
+    static Article parse(String html, String url) {
+        String biz = pageVar(html, url, "biz", "[A-Za-z0-9+/=%]+", "__biz").replace("%3D", "=");
+        String mid = pageVar(html, url, "mid", "\\d+", "mid");
+        String idx = pageVar(html, url, "idx", "\\d+", "idx");
+        String sn = pageVar(html, url, "sn", "[0-9a-f]+", "sn");
         String title = firstVar(html, "var msg_title = '(.*?)'\\.html");
         boolean hasBody = html.contains("id=\"js_content\"") || html.contains("content_noencode")
                 || html.contains("picture_page_info_list");
 
         if (!hasBody || mid.isEmpty()) {
-            Status s = html.contains("环境异常") || html.contains("wappoc_appmsgcaptcha") ? Status.BLOCKED
-                    : html.contains("参数错误") ? Status.INVALID : Status.GONE;
+            Status s = containsAny(html, BLOCKED_HINTS) ? Status.BLOCKED
+                    : html.contains("参数错误") ? Status.INVALID
+                    : containsAny(html, DELETED_HINTS) ? Status.DELETED : Status.UNKNOWN;
             return new Article(s, biz, mid, idx, sn, "", "", "", "", "", List.of());
         }
 
@@ -63,6 +76,9 @@ final class ArticleParser {
         Element authorEl = doc.selectFirst("meta[name=author]");
         String author = authorEl != null ? authorEl.attr("content").strip() : "";
         String ct = firstVar(html, "var ct = \"(\\d{9,11})\"");
+        if (ct.isEmpty()) {
+            ct = firstVar(html, "\\bct\\s*[:=]\\s*[^;\\n]{0,80}?['\"](\\d{9,11})['\"]");
+        }
         String date = ct.isEmpty() ? firstVar(html, "create_time:\\s*'(\\d{4}-\\d{2}-\\d{2})")
                 : DAY.format(Instant.ofEpochSecond(Long.parseLong(ct)));
 
@@ -217,6 +233,45 @@ final class ArticleParser {
             }
         }
         return urls;
+    }
+
+    /**
+     * 依次尝试：{@code var x = "v"}、{@code var x = "" || "v"}、文章链接的查询参数，
+     * 最后才用宽松写法 {@code x: 'v'} / {@code d.x = xml ? ... : 'v'}——页面里的推荐文章列表也有 mid，
+     * 宽松匹配可能抓到别的文章，所以排在链接参数之后。
+     */
+    private static String pageVar(String html, String url, String name, String value, String urlParam) {
+        String v = "(" + value + ")";
+        String s = firstVar(html, "var " + name + " = \"" + v + "\"");
+        if (s.isEmpty()) {
+            s = firstVar(html, "var " + name + " = \"\"\\s*\\|\\|\\s*\"" + v + "\"");
+        }
+        if (s.isEmpty()) {
+            s = firstVar(url, "[?&]" + Pattern.quote(urlParam) + "=" + v);
+        }
+        if (s.isEmpty()) {
+            s = firstVar(html, "\\." + name + "\\s*=\\s*[^;\\n]{0,80}?:\\s*['\"]" + v + "['\"]");
+        }
+        if (s.isEmpty()) {
+            s = firstVar(html, "[\\s,{]" + name + "\\s*:\\s*['\"]" + v + "['\"]");
+        }
+        return s;
+    }
+
+    private static final String[] BLOCKED_HINTS = {
+        "环境异常", "wappoc_appmsgcaptcha", "暂无权限查看此页面", "失效的验证页面",
+    };
+    private static final String[] DELETED_HINTS = {
+        "已被发布者删除", "因违规无法查看", "已停止访问该网页", "由用户投诉并经平台审核", "该内容已被删除",
+    };
+
+    private static boolean containsAny(String s, String[] needles) {
+        for (String n : needles) {
+            if (s.contains(n)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static String firstVar(String html, String regex) {

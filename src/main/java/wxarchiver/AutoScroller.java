@@ -73,23 +73,23 @@ final class AutoScroller {
         int flicks = 0;
         long deadline = System.currentTimeMillis() + maxMinutes * 60_000L;
         ThreadLocalRandom rnd = ThreadLocalRandom.current();
-        int nextBreak = rnd.nextInt(6, 13);
+        int nextBreak = rnd.nextInt(10, 19);
 
         while (System.currentTimeMillis() < deadline) {
-            // 一下拨半圈（9–13 格）
-            String stop = flick(robot, rnd.nextInt(9, 14), anchor, wechatPids, rnd);
+            // 一下拨大半圈（14–20 格）
+            String stop = flick(robot, rnd.nextInt(14, 21), anchor, wechatPids, rnd);
             if (stop != null) {
                 Archiver.log("%s，已停止（共拨动 %d 下）。", stop, flicks);
                 return stopped(stop, flicks);
             }
             flicks++;
-            Thread.sleep(rnd.nextLong(600, 1500));   // 等新文章加载
+            Thread.sleep(rnd.nextLong(300, 800));    // 等新文章加载
 
             // 偶尔往回拨一点，像回看了一眼刚划过的标题
             if (rnd.nextInt(15) == 0) {
                 int back = rnd.nextInt(2, 5);
                 if ((stop = flick(robot, -back, anchor, wechatPids, rnd)) == null) {
-                    Thread.sleep(rnd.nextLong(800, 2000));
+                    Thread.sleep(rnd.nextLong(400, 1000));
                     stop = flick(robot, back, anchor, wechatPids, rnd);
                 }
                 if (stop != null) {
@@ -97,10 +97,10 @@ final class AutoScroller {
                     return stopped(stop, flicks);
                 }
             }
-            // 每拨 6–12 下歇一会儿
+            // 每拨 10–18 下歇一会儿
             if (--nextBreak == 0) {
-                Thread.sleep(rnd.nextLong(3000, 8000));
-                nextBreak = rnd.nextInt(6, 13);
+                Thread.sleep(rnd.nextLong(1500, 4000));
+                nextBreak = rnd.nextInt(10, 19);
             }
 
             int[] shot = snapshot(robot, probe);
@@ -148,7 +148,7 @@ final class AutoScroller {
             }
             robot.mouseWheel(dir);
             boolean edge = i < 2 || i >= n - 2;
-            Thread.sleep(edge ? rnd.nextLong(30, 60) : rnd.nextLong(12, 30));
+            Thread.sleep(edge ? rnd.nextLong(15, 30) : rnd.nextLong(6, 15));
         }
         return null;
     }

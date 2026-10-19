@@ -63,8 +63,10 @@ final class Archiver {
                 continue;
             }
             ArticleParser.Article a;
+            String page;
             try {
-                a = ArticleParser.parse(http.getPage(url));
+                page = http.getPage(url);
+                a = ArticleParser.parse(page, url);
             } catch (IOException e) {
                 log("  [网络错误] %s %s", url, e.getMessage());
                 pause();
@@ -83,8 +85,17 @@ final class Archiver {
                 continue;
             }
             blockedInARow = 0;
+            if (a.status() == ArticleParser.Status.UNKNOWN) {
+                // 认不出的页面不记进度，下次运行重试；原始页面留一份方便排查
+                Path dump = out.resolve(".debug").resolve((key != null ? key : md5(url)) + ".html");
+                Files.createDirectories(dump.getParent());
+                Files.writeString(dump, page, StandardCharsets.UTF_8);
+                log("  [未识别的页面，下次重试] %s（页面已存到 %s）", url, out.relativize(dump));
+                pause();
+                continue;
+            }
             if (a.status() != ArticleParser.Status.OK) {
-                log("  [%s] %s", a.status() == ArticleParser.Status.GONE ? "已删除/不可访问" : "链接无效", url);
+                log("  [%s] %s", a.status() == ArticleParser.Status.DELETED ? "已删除/违规" : "链接无效", url);
                 record(key != null ? key : url, a.status().name(), "");
                 pause();
                 continue;
@@ -237,7 +248,8 @@ final class Archiver {
         if (Files.exists(p)) {
             for (String line : Files.readAllLines(p, StandardCharsets.UTF_8)) {
                 String[] f = line.split("\t");
-                if (f.length >= 2) {
+                // 旧版本把认不出的页面（如图文消息）都记成 GONE，这些记录不可信，忽略后会重新抓
+                if (f.length >= 2 && !"GONE".equals(f[1])) {
                     done.add(f[0]);
                 }
             }

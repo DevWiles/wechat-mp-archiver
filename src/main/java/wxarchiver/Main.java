@@ -42,7 +42,7 @@ public final class Main {
         String url = require(a, "url").strip();
         ArticleParser.Article art;
         try {
-            art = ArticleParser.parse(new SafeHttp().getPage(url));
+            art = ArticleParser.parse(new SafeHttp().getPage(url), url);
         } catch (IllegalArgumentException e) {
             Archiver.log("这不是公众号文章链接（应以 https://mp.weixin.qq.com/ 开头）。");
             System.exit(3);
