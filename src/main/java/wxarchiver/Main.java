@@ -28,6 +28,8 @@ public final class Main {
         }
         Map<String, String> a = parse(Arrays.copyOfRange(argv, 1, argv.length));
         switch (argv[0]) {
+            case "resolve" -> resolve(a);
+            case "status" -> status(a);
             case "scroll" -> scroll(a);
             case "scan" -> scan(a);
             case "fetch" -> fetch(a);
@@ -35,11 +37,49 @@ public final class Main {
         }
     }
 
+    /** 从任意一篇文章链接识别公众号，输出 name= / biz= 两行，供一键脚本读取。 */
+    private static void resolve(Map<String, String> a) throws Exception {
+        String url = require(a, "url").strip();
+        ArticleParser.Article art;
+        try {
+            art = ArticleParser.parse(new SafeHttp().getPage(url));
+        } catch (IllegalArgumentException e) {
+            Archiver.log("这不是公众号文章链接（应以 https://mp.weixin.qq.com/ 开头）。");
+            System.exit(3);
+            return;
+        }
+        if (art.biz().isEmpty() || art.account().isEmpty()) {
+            Archiver.log(art.status() == ArticleParser.Status.BLOCKED
+                    ? "微信暂时限流了，过一会儿再试。" : "没能从这个链接识别出公众号，换一篇文章的链接试试。");
+            System.exit(3);
+        }
+        Archiver.log("name=" + art.account());
+        Archiver.log("biz=" + art.biz());
+    }
+
+    /** 输出链接清单的进度：total= / done= / pending=。 */
+    private static void status(Map<String, String> a) throws Exception {
+        Path urls = Path.of(require(a, "urls"));
+        Path out = Path.of(require(a, "out"));
+        List<String> list = Files.exists(urls) ? readUrls(urls) : List.of();
+        long pending = Archiver.pending(out, list);
+        Archiver.log("total=" + list.size());
+        Archiver.log("done=" + (list.size() - pending));
+        Archiver.log("pending=" + pending);
+    }
+
+    private static List<String> readUrls(Path f) throws Exception {
+        return Files.readAllLines(f, StandardCharsets.UTF_8).stream()
+                .map(String::strip).filter(s -> s.startsWith("http")).distinct().toList();
+    }
+
     private static void scroll(Map<String, String> a) throws Exception {
         requireWindows("scroll");
         AutoScroller.Result r = AutoScroller.run(procs(a), Integer.parseInt(a.getOrDefault("minutes", "40")));
-        if (r == AutoScroller.Result.ABORTED) {
-            // 没滚完就扫，只会拿到首屏那二十来篇，不如直接让用户重来
+        // 只检查新文章时（--partial-ok），用户看到旧文章后动鼠标停下是正常的，照样扫描；清单会与旧的合并
+        boolean partialOk = "true".equalsIgnoreCase(a.get("partial-ok")) && r == AutoScroller.Result.USER_STOPPED;
+        if (!partialOk && (r == AutoScroller.Result.ABORTED || r == AutoScroller.Result.USER_STOPPED)) {
+            // 第一次抓取时没滚完就扫，只会拿到首屏那二十来篇，不如直接让用户重来
             Archiver.log("滚动未完成，不扫描链接。");
             System.exit(2);
         }
@@ -73,9 +113,14 @@ public final class Main {
             Archiver.log("pid=%d：读取 %s，新增链接 %d", pid,
                     bytes < 0 ? "失败（无权限）" : (bytes >> 20) + "MB", ex.size() - before);
         }
+        // 与已有清单合并：只滚了前几屏检查新文章时，不会把旧链接弄丢
+        int found = ex.size();
+        if (Files.exists(outFile)) {
+            readUrls(outFile).forEach(ex::feed);
+        }
         List<String> urls = ex.urls();
         Files.write(outFile, urls, StandardCharsets.UTF_8);
-        Archiver.log("\n目标号文章链接 %d 条（带 chksm 的 %d 条）→ %s", urls.size(), ex.withChksm(), outFile);
+        Archiver.log("\n本次扫到目标号文章链接 %d 条，合并后清单共 %d 条 → %s", found, urls.size(), outFile);
         Archiver.log("只保存了链接本身，没有保存任何其它内存内容。");
     }
 
@@ -87,8 +132,7 @@ public final class Main {
         Archiver.Images images = Archiver.Images.valueOf(a.getOrDefault("images", "local").toUpperCase());
         int limit = Integer.parseInt(a.getOrDefault("limit", String.valueOf(Integer.MAX_VALUE)));
 
-        List<String> urls = Files.readAllLines(urlsFile, StandardCharsets.UTF_8).stream()
-                .map(String::strip).filter(s -> s.startsWith("http")).distinct().toList();
+        List<String> urls = readUrls(urlsFile);
         Archiver.log("待处理 %d 条，间隔约 %.1f 秒，输出到 %s", urls.size(), delay, out);
         new Archiver(out, biz, delay, images).run(urls, limit);
     }
@@ -126,8 +170,14 @@ public final class Main {
         Archiver.log("""
                 wx-archiver —— 公众号历史文章 → Markdown（Obsidian）
 
+                最省事：双击 run.bat。下面是分步命令。
+
+                0) 从任意一篇文章链接识别公众号（输出 name= / biz=）：
+                   java -jar wx-archiver.jar resolve --url <文章链接>
+
                 1) 在微信电脑版里打开目标公众号主页，鼠标停在文章列表上，自动慢速滚到底并扫链接：
-                   java -jar wx-archiver.jar scroll --biz <biz> --out urls.txt [--minutes 40]
+                   java -jar wx-archiver.jar scroll --biz <biz> --out urls.txt [--minutes 40] [--partial-ok true]
+                   （--partial-ok：只检查新文章时，动鼠标提前停下也照样扫描；新旧清单自动合并）
                    （也可以自己手动滚到底，再单独运行 scan --biz <biz> --out urls.txt）
 
                 2) 抓正文、图片落本地、生成索引（可中断，重跑自动续抓）：

@@ -222,6 +222,16 @@ final class Archiver {
         return index;
     }
 
+    /** 清单里还没处理过的条数（判定规则与 run() 跳过已完成的规则一致）。 */
+    static long pending(Path out, List<String> urls) throws IOException {
+        Archiver probe = new Archiver(out, "", 0, Images.NONE);
+        probe.loadState();
+        return urls.stream().filter(u -> {
+            String k = keyOf(u);
+            return !probe.done.contains(u) && (k == null || !probe.done.contains(k));
+        }).count();
+    }
+
     private void loadState() throws IOException {
         Path p = out.resolve(STATE);
         if (Files.exists(p)) {

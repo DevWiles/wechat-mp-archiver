@@ -30,7 +30,10 @@ import java.util.concurrent.ThreadLocalRandom;
  */
 final class AutoScroller {
 
-    enum Result { BOTTOM, TIME_LIMIT, ABORTED }
+    /** USER_STOPPED：滚了一段后用户动鼠标主动停下；ABORTED：没能开始或窗口丢失。 */
+    enum Result { BOTTOM, TIME_LIMIT, USER_STOPPED, ABORTED }
+
+    private static final String MOVED = "检测到鼠标移动";
 
     private static final int STILL_FLICKS_TO_STOP = 6;    // 连续多少下画面不变算到底
     private static final int MOUSE_TOLERANCE = 6;         // 物理像素，超过即视为用户接管
@@ -77,7 +80,7 @@ final class AutoScroller {
             String stop = flick(robot, rnd.nextInt(9, 14), anchor, wechatPids, rnd);
             if (stop != null) {
                 Archiver.log("%s，已停止（共拨动 %d 下）。", stop, flicks);
-                return Result.ABORTED;
+                return stopped(stop, flicks);
             }
             flicks++;
             Thread.sleep(rnd.nextLong(600, 1500));   // 等新文章加载
@@ -91,7 +94,7 @@ final class AutoScroller {
                 }
                 if (stop != null) {
                     Archiver.log("%s，已停止（共拨动 %d 下）。", stop, flicks);
-                    return Result.ABORTED;
+                    return stopped(stop, flicks);
                 }
             }
             // 每拨 6–12 下歇一会儿
@@ -121,6 +124,10 @@ final class AutoScroller {
         return Result.TIME_LIMIT;
     }
 
+    private static Result stopped(String reason, int flicks) {
+        return MOVED.equals(reason) && flicks > 0 ? Result.USER_STOPPED : Result.ABORTED;
+    }
+
     /**
      * 像手指拨一下滚轮：连续发 |notches| 格，开头结尾慢、中间快。
      * 每格之前都检查一次鼠标，保证用户一动就能停。
@@ -134,7 +141,7 @@ final class AutoScroller {
         for (int i = 0; i < n; i++) {
             WinDef.POINT p = cursor();
             if (distance(p, anchor) > MOUSE_TOLERANCE) {
-                return "检测到鼠标移动";
+                return MOVED;
             }
             if (!wechatUnder(p, pids)) {
                 return "鼠标下面已不是微信窗口";

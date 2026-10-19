@@ -17,25 +17,29 @@ mkdir -p "$OUT"
 URLS="$OUT/urls.txt"
 
 echo; echo "===== 第 1 步：获取文章链接 ====="
-reuse=n
-if [ -s "$URLS" ]; then
-    read -rp "已有链接清单 $URLS，直接复用？[Y/n] " reuse; reuse=${reuse:-y}
+# 是/否：直接回车 = 是；只有输入 N 再回车才算否
+yes() { local v; read -rp "$1 [回车=是，输入 N 回车=否] " v; [[ ! $v =~ ^[[:space:]]*[Nn] ]]; }
+
+reuse=false
+if [ -s "$URLS" ] && yes "已有链接清单 $URLS，直接复用？"; then
+    reuse=true
 fi
-if [[ ! $reuse =~ ^[Yy] ]]; then
+if ! $reuse; then
     echo "请先在微信电脑版里打开「$NAME」的主页。"
-    read -rp "自动慢速滚动到底？[Y=自动 / n=我自己手动滚，回车=Y] " mode; mode=${mode:-y}
-    while [[ $mode =~ ^[Yy] ]]; do
+    auto=false
+    yes "自动慢速滚动到底？（选否 = 我自己手动滚）" && auto=true
+    while $auto; do
         read -rp "回车后，切到微信公众号主页，把鼠标放在文章列表上别动，静止 3 秒自动开始..." _
         if java -jar target/wx-archiver.jar scroll --biz "$BIZ" --out "$URLS"; then
             break
         fi
-        read -rp "滚动没有完成。R=重试 / M=改为手动滚 / Q=退出 [回车=R] " ans; ans=${ans:-r}
+        read -rp "滚动没有完成。[回车=重试，输入 M 回车=改为手动滚，输入 Q 回车=退出] " ans
         case $ans in
             [Qq]*) exit 1 ;;
-            [Mm]*) mode=n ;;
+            [Mm]*) auto=false ;;
         esac
     done
-    if [[ ! $mode =~ ^[Yy] ]]; then
+    if ! $auto; then
         read -rp "请手动把历史文章一直滚到底（直到不再加载新文章），然后按回车继续..." _
         java -jar target/wx-archiver.jar scan --biz "$BIZ" --out "$URLS"
     fi
