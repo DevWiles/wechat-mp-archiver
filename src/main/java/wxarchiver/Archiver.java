@@ -5,6 +5,7 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -15,6 +16,12 @@ import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Set;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -31,6 +38,7 @@ final class Archiver {
     private static final String STATE = ".archiver-state.tsv";
     private static final String INDEX = "00-索引.md";
     private static final Pattern KEY_IN_URL = Pattern.compile("mid=(\\d+).*?idx=(\\d+)");
+    private static final Pattern REMOTE_IMG = Pattern.compile("!\\[[^\\]]*]\\((https?://[^)\\s]+)\\)");
     private static final Pattern FM_FIELD = Pattern.compile("(?m)^(title|date):\\s*\"?(.*?)\"?\\s*$");
 
     private final SafeHttp http = new SafeHttp();
@@ -40,6 +48,10 @@ final class Archiver {
     private final double delaySec;
     private final Images images;
     private final Set<String> done = new HashSet<>();
+    // 图片走 CDN，并发下载不会触发文章页风控；文章页仍逐篇串行请求
+    private static final int IMAGE_THREADS = 6;
+    private ExecutorService imagePool;
+    private long lastPageAt;
 
     Archiver(Path out, String biz, double delaySec, Images images) {
         this.out = out;
@@ -52,6 +64,19 @@ final class Archiver {
     void run(List<String> urls, int limit) throws IOException, InterruptedException {
         Files.createDirectories(attachments);
         loadState();
+        imagePool = Executors.newFixedThreadPool(IMAGE_THREADS, r -> {
+            Thread t = new Thread(r, "image-download");
+            t.setDaemon(true);
+            return t;
+        });
+        try {
+            fetchAll(urls, limit);
+        } finally {
+            imagePool.shutdownNow();
+        }
+    }
+
+    private void fetchAll(List<String> urls, int limit) throws IOException, InterruptedException {
         int ok = 0;
         int skipped = 0;
         int blockedInARow = 0;
@@ -65,6 +90,7 @@ final class Archiver {
             ArticleParser.Article a;
             String page;
             try {
+                lastPageAt = System.currentTimeMillis();
                 page = http.getPage(url);
                 a = ArticleParser.parse(page, url);
             } catch (IOException e) {
@@ -116,6 +142,9 @@ final class Archiver {
             log("  [%d] %s %s", ok, a.date(), a.title());
             pause();
         }
+        if (images == Images.LOCAL) {
+            repairImages();
+        }
         Path index = writeIndex();
         log("\n本次新增 %d 篇，跳过已完成 %d 条。索引：%s", ok, skipped, index);
     }
@@ -124,12 +153,18 @@ final class Archiver {
 
     private Path writeNote(ArticleParser.Article a, String sourceUrl) throws IOException, InterruptedException {
         String body = a.markdown();
+        Map<String, Future<String>> downloads = new LinkedHashMap<>();
+        if (images == Images.LOCAL) {
+            for (String img : a.images()) {
+                downloads.put(img, imagePool.submit(() -> downloadImage(img)));
+            }
+        }
         for (String img : a.images()) {
             body = switch (images) {
                 case NONE -> body.replace("![](" + img + ")", "");
                 case REMOTE -> body;
                 case LOCAL -> {
-                    String local = downloadImage(img);
+                    String local = awaitImage(downloads.get(img));
                     yield local == null ? body : body.replace("](" + img + ")", "](attachments/" + local + ")");
                 }
             };
@@ -156,6 +191,15 @@ final class Archiver {
         return note;
     }
 
+    private static String awaitImage(Future<String> f) throws InterruptedException {
+        try {
+            return f.get();
+        } catch (ExecutionException e) {
+            log("    图片下载失败（保留外链）：%s", e.getCause());
+            return null;
+        }
+    }
+
     /** @return attachments 下的文件名；不在白名单或下载失败返回 null（正文保留原外链） */
     private String downloadImage(String url) throws InterruptedException {
         if (!SafeHttp.isAllowedImage(url)) {
@@ -167,18 +211,72 @@ final class Archiver {
             if (Files.exists(dest) && Files.size(dest) > 0) {
                 return name;
             }
-            for (int attempt = 0; attempt < 3; attempt++) {
+        } catch (IOException e) {
+            // 读不到就当没下过，往下重新下载
+        }
+        // 网络抖动（超时、连接被重置）也要重试：以前只有状态码不对才重试，一次异常就直接放弃
+        String reason = "";
+        for (int attempt = 0; attempt < 4; attempt++) {
+            if (attempt > 0) {
+                Thread.sleep(1000L * attempt);
+            }
+            try {
                 HttpResponse<byte[]> r = http.getImage(url);
-                if (r.statusCode() == 200 && r.body().length > 0) {
-                    Files.write(dest, r.body());
+                String type = r.headers().firstValue("Content-Type").orElse("image/");
+                if (r.statusCode() == 200 && r.body().length > 0 && type.startsWith("image/")) {
+                    // 先写临时文件再改名，中途中断不会留下半张图被当成已下载
+                    Path tmp = attachments.resolve(name + ".part");
+                    Files.write(tmp, r.body());
+                    Files.move(tmp, dest, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
                     return name;
                 }
-                Thread.sleep(500L * (attempt + 1));
+                reason = "HTTP " + r.statusCode() + " " + type;
+            } catch (IOException e) {
+                reason = e.getClass().getSimpleName() + (e.getMessage() == null ? "" : " " + e.getMessage());
             }
-        } catch (IOException e) {
-            log("    图片下载失败（保留外链）：%s", e.getMessage());
         }
+        log("    图片下载失败（保留外链，下次运行会再试）：%s  %s", reason, url);
         return null;
+    }
+
+    /** 已有笔记里仍是外链的图片（之前下载失败的），再下载一次并改成本地路径。 */
+    private void repairImages() throws IOException, InterruptedException {
+        List<Path> notes;
+        try (Stream<Path> s = Files.list(out)) {
+            notes = s.filter(p -> p.toString().endsWith(".md")).toList();
+        }
+        int fixed = 0;
+        int failed = 0;
+        for (Path note : notes) {
+            String text = Files.readString(note, StandardCharsets.UTF_8);
+            Matcher m = REMOTE_IMG.matcher(text);
+            Map<String, Future<String>> downloads = new LinkedHashMap<>();
+            while (m.find()) {
+                String url = m.group(1);
+                if (SafeHttp.isAllowedImage(url) && !downloads.containsKey(url)) {
+                    downloads.put(url, imagePool.submit(() -> downloadImage(url)));
+                }
+            }
+            if (downloads.isEmpty()) {
+                continue;
+            }
+            String updated = text;
+            for (Map.Entry<String, Future<String>> e : downloads.entrySet()) {
+                String local = awaitImage(e.getValue());
+                if (local == null) {
+                    failed++;
+                } else {
+                    updated = updated.replace("](" + e.getKey() + ")", "](attachments/" + local + ")");
+                    fixed++;
+                }
+            }
+            if (!updated.equals(text)) {
+                Files.writeString(note, updated, StandardCharsets.UTF_8);
+            }
+        }
+        if (fixed + failed > 0) {
+            log("补下载之前失败的图片：成功 %d 张，仍失败 %d 张。", fixed, failed);
+        }
     }
 
     private static String ext(String url) {
@@ -266,8 +364,12 @@ final class Archiver {
 
     private void pause() throws InterruptedException {
         // 随机抖动，避免固定节奏
+        // 从上一次请求文章页开始计时：下载图片花掉的时间算在间隔里，不再额外等
         double s = delaySec * (0.8 + ThreadLocalRandom.current().nextDouble() * 0.6);
-        Thread.sleep((long) (s * 1000));
+        long left = lastPageAt + (long) (s * 1000) - System.currentTimeMillis();
+        if (left > 0) {
+            Thread.sleep(left);
+        }
     }
 
     private static String keyOf(String url) {
